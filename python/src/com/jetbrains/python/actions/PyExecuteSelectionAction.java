@@ -34,12 +34,63 @@ import com.jetbrains.python.run.PythonRunConfiguration;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Scanner;
+import java.util.stream.Collectors;
 
 public class PyExecuteSelectionAction extends DumbAwareAction {
 
   public PyExecuteSelectionAction() {
     super(PyBundle.messagePointer("python.execute.selection.action.execute.selection.in.console"));
+  }
+
+  private static final String PYCHARM_REPL_SRC = "#! /usr/bin/env python3\n" +
+                                                 "import socket, sys\n" +
+                                                 "SOCKET_FILENAME=\"/tmp/emacs_python_mode_repl_socket\"\n" +
+                                                 "\n" +
+                                                 "with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as s:\n" +
+                                                 "\ts.connect(SOCKET_FILENAME)\n" +
+                                                 "\ts.sendall(sys.stdin.buffer.read())\n" +
+                                                 "\ts.shutdown(socket.SHUT_WR)\n" +
+                                                 "\n" +
+                                                 "\tprint(s.recv(1<<20).decode())\n" +
+                                                 "\ts.shutdown(socket.SHUT_RDWR)\n";
+
+  private static void executeCodeBlock(final AnActionEvent e, final Editor editor) throws IOException {
+    final ProcessBuilder pb = new ProcessBuilder("python3", "-c", PYCHARM_REPL_SRC);
+    final Process proc = pb.start();
+    final String lines = getLinesAfterCaret(editor);
+    if (lines == null) {
+      return;
+    }
+    try (OutputStream os = proc.getOutputStream()) {
+      os.write(lines.getBytes(StandardCharsets.UTF_8));
+    }
+    final String procOut;
+    try (InputStream is = proc.getInputStream()) {
+      Scanner s = new Scanner(is, StandardCharsets.UTF_8.toString()).useDelimiter("\\A");
+      procOut = s.hasNext() ? s.next() : "";
+    }
+    final String[] numLinesAndMsg = procOut.split("\n\n", 2);
+    if (numLinesAndMsg[0].equals("syntax_error_in_python_source_code")) {
+      showConsoleAndExecuteCode(e, Arrays.stream(numLinesAndMsg[1].split("\n")).map(line -> "# " + line)
+        .collect(Collectors.joining("\n")).trim());
+    }
+    else {
+      final int numLines = Integer.parseInt(numLinesAndMsg[0]);
+      if (!numLinesAndMsg[1].trim().isEmpty()) {
+        showConsoleAndExecuteCode(e, numLinesAndMsg[1].trim());
+      }
+      for (int i = 0; i < numLines; ++i) {
+        moveCaretDown(editor);
+      }
+    }
   }
 
   @Override
@@ -51,10 +102,11 @@ public class PyExecuteSelectionAction extends DumbAwareAction {
         showConsoleAndExecuteCode(e, selectionText);
       }
       else {
-        String line = getLineUnderCaret(editor);
-        if (line != null) {
-          showConsoleAndExecuteCode(e, line.trim());
-          moveCaretDown(editor);
+        try {
+          executeCodeBlock(e, editor);
+        }
+        catch (IOException exec) {
+          throw new UncheckedIOException(exec);
         }
       }
     }
@@ -114,6 +166,20 @@ public class PyExecuteSelectionAction extends DumbAwareAction {
     ApplicationManager.getApplication().invokeLater(() -> {
       selectConsole(project, codeExecutor -> executeInConsole(codeExecutor, selectionText, null), null, true);
     });
+  }
+
+  private static String getLinesAfterCaret(Editor editor) {
+    VisualPosition caretPos = editor.getCaretModel().getVisualPosition();
+
+    Pair<LogicalPosition, LogicalPosition> lines = EditorUtil.calcSurroundingRange(editor, caretPos, caretPos);
+
+    LogicalPosition lineStart = lines.first;
+    int start = editor.logicalPositionToOffset(lineStart);
+    int end = editor.getDocument().getCharsSequence().length();
+    if (end <= start) {
+      return null;
+    }
+    return editor.getDocument().getCharsSequence().subSequence(start, end).toString();
   }
 
   private static String getLineUnderCaret(Editor editor) {
